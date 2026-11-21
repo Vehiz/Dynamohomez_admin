@@ -4,7 +4,7 @@ Standalone operations console for the DynamoHomez rental and shared-accommodatio
 
 ## Current milestone
 
-The app currently provides the responsive admin shell, navigation, theme, overview layout, and searchable listings preview. All displayed metrics and records are sample UI data. Administrative mutations and live backend data are deliberately disabled until guarded backend APIs and audit logging are available.
+The app provides the responsive admin shell, administrator sign-in, a live read-only overview, and searchable/paginated listing summaries. Operational writes are disabled until their server-side authorization and audit APIs are implemented.
 
 ## Local development
 
@@ -12,7 +12,7 @@ The app currently provides the responsive admin shell, navigation, theme, overvi
 2. Copy `.env.example` to `.env.local` and set `VITE_BACKEND_ORIGIN` if the NestJS API is not at `http://localhost:4000`.
 3. Run `npm install` and `npm run dev`.
 
-The Vite dev server proxies `/api` to the configured backend origin. Do not put credentials, private API keys, or other secrets in `VITE_*` variables; they are embedded into the browser bundle.
+The Vite dev server proxies `/api` to the configured backend origin. Set `VITE_BACKEND_ORIGIN` to the actual local backend address if it is not `http://localhost:4000`. Do not put credentials, private API keys, or other secrets in `VITE_*` variables; they are embedded into the browser bundle.
 
 ## Checks
 
@@ -23,7 +23,7 @@ The Vite dev server proxies `/api` to the configured backend origin. Do not put 
 
 ## Security boundary
 
-The frontend is not an authorization boundary. Every admin endpoint and mutation must enforce server-side roles, validate input, minimize sensitive data, and write an audit event. Do not enable privileged UI actions until the backend contract and permission tests are in place.
+The frontend is not an authorization boundary. The current backend provides read-only admin overview and listing summary endpoints guarded by the `admin` role. Every new admin endpoint and mutation must enforce server-side roles, validate input, minimize sensitive data, and write an audit event. Admin account provisioning is documented in the backend `ADMIN_ACCESS.md`; do not grant admin access through public signup or client-side state.
 
 ---
 
