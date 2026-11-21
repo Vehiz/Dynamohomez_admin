@@ -27,6 +27,8 @@ The frontend is not an authorization boundary. The current backend provides read
 
 For local development credentials, run `npm run admin:create` from the backend directory and enter the email and password directly into its interactive terminal prompts. The command is blocked outside `NODE_ENV=development`; never commit credentials or put passwords in shell commands or frontend environment variables.
 
+Admin sessions keep their access and refresh tokens only in `sessionStorage`, refresh shortly before access-token expiry, retry one failed request after refresh, revoke the refresh token on sign-out, and sign out after 15 minutes without user activity. Browser storage remains accessible to JavaScript, so deploy only with a strong Content Security Policy and avoid third-party scripts on the admin origin.
+
 ---
 
 The original Vite template notes are retained below for reference.

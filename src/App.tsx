@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import {
   Activity,
   ArrowRight,
@@ -82,7 +82,23 @@ type AdminListing = {
 }
 
 type AdminListingPage = { items: AdminListing[]; page: number; limit: number; total: number }
+type ModerationAction = 'approve' | 'reject' | 'flag'
+
+type ListingModerationAudit = {
+  id: string
+  listing_id: string
+  admin_id: string
+  action: ModerationAction
+  reason: string
+  previous_status: string
+  new_status: string
+  created_at: string
+}
+
 const ADMIN_SESSION_KEY = 'dh_admin_session'
+const IDLE_TIMEOUT_MS = 15 * 60 * 1000
+const ACCESS_REFRESH_WINDOW_MS = 60 * 1000
+let refreshInFlight: Promise<AdminSession | null> | null = null
 
 function readAdminSession(): AdminSession | null {
   try {
@@ -93,33 +109,127 @@ function readAdminSession(): AdminSession | null {
   }
 }
 
-async function adminFetch<T>(path: string, token: string): Promise<T> {
-  const response = await fetch(`/api${path}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  })
-  const result = await response.json().catch(() => null)
-  if (!response.ok || !result?.success) {
-    const error = new Error(result?.error || result?.message || 'Admin API request failed') as Error & { status?: number }
-    error.status = response.status
-    throw error
+async function adminFetch<T>(path: string, token: string, options?: { method?: string; body?: unknown }): Promise<T> {
+  let session = readAdminSession()
+  if (!session?.tokens?.refreshToken) throw makeAdminAuthError('Admin session is missing.', 401)
+
+  if (isAccessTokenExpiring(session.tokens.accessToken)) {
+    session = await refreshAdminSession()
+    if (!session) throw makeAdminAuthError('Admin session expired. Sign in again.', 401)
   }
-  return result.data as T
+
+  let result = await requestAdminApi<T>(path, session?.tokens?.accessToken || token, options)
+  if (result.status === 401) {
+    session = await refreshAdminSession()
+    if (!session) throw makeAdminAuthError('Admin session expired. Sign in again.', 401)
+    result = await requestAdminApi<T>(path, session.tokens.accessToken, options)
+  }
+
+  if (!result.ok || !result.body?.success) {
+    throw makeAdminAuthError(result.body?.error || result.body?.message || 'Admin API request failed', result.status)
+  }
+  return result.body.data as T
+}
+
+async function requestAdminApi<T>(path: string, accessToken: string, options?: { method?: string; body?: unknown }) {
+  const response = await fetch(`/api${path}`, {
+    method: options?.method || 'GET',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      ...(options?.body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: options?.body ? JSON.stringify(options.body) : undefined,
+  })
+  const body = await response.json().catch(() => null) as { success?: boolean; data?: T; error?: string; message?: string } | null
+  return { body, ok: response.ok, status: response.status }
+}
+
+function makeAdminAuthError(message: string, status: number) {
+  return Object.assign(new Error(message), { status })
+}
+
+function readJwtPayload(token: string): Record<string, unknown> | null {
+  try {
+    const encoded = token.split('.')[1]
+    if (!encoded) return null
+    const normalized = encoded.replace(/-/g, '+').replace(/_/g, '/')
+    return JSON.parse(atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '='))) as Record<string, unknown>
+  } catch {
+    return null
+  }
+}
+
+function isAccessTokenExpiring(token: string): boolean {
+  const exp = readJwtPayload(token)?.exp
+  return typeof exp !== 'number' || exp * 1000 <= Date.now() + ACCESS_REFRESH_WINDOW_MS
+}
+
+async function refreshAdminSession(): Promise<AdminSession | null> {
+  if (refreshInFlight) return refreshInFlight
+
+  refreshInFlight = (async () => {
+    const current = readAdminSession()
+    const refreshToken = current?.tokens?.refreshToken
+    if (!current || !refreshToken) {
+      sessionStorage.removeItem(ADMIN_SESSION_KEY)
+      return null
+    }
+
+    try {
+      const response = await fetch('/api/auth/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refreshToken }),
+      })
+      const result = await response.json().catch(() => null) as { success?: boolean; data?: AdminSession['tokens'] } | null
+      if (!response.ok || !result?.success || !result.data?.accessToken || !result.data.refreshToken) {
+        throw new Error('Refresh token is no longer valid.')
+      }
+
+      const payload = readJwtPayload(result.data.accessToken)
+      const tokenRoles = payload?.roles
+      if (payload?.role !== 'admin' && !(Array.isArray(tokenRoles) && tokenRoles.includes('admin'))) {
+        throw new Error('Administrator access was revoked.')
+      }
+
+      const refreshed: AdminSession = { ...current, tokens: result.data }
+      sessionStorage.setItem(ADMIN_SESSION_KEY, JSON.stringify(refreshed))
+      return refreshed
+    } catch {
+      sessionStorage.removeItem(ADMIN_SESSION_KEY)
+      return null
+    }
+  })().finally(() => { refreshInFlight = null })
+
+  return refreshInFlight
+}
+
+function revokeAdminSession(session: AdminSession | null): void {
+  if (session?.tokens?.refreshToken) {
+    void fetch('/api/auth/logout', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshToken: session.tokens.refreshToken }),
+      keepalive: true,
+    }).catch(() => undefined)
+  }
+  sessionStorage.removeItem(ADMIN_SESSION_KEY)
 }
 
 function App() {
   const [session, setSession] = useState<AdminSession | null>(readAdminSession)
 
-  const handleLogout = () => {
-    sessionStorage.removeItem(ADMIN_SESSION_KEY)
+  const handleLogout = useCallback(() => {
+    revokeAdminSession(readAdminSession())
     setSession(null)
-  }
+  }, [])
 
   const handleLogin = (nextSession: AdminSession) => {
     sessionStorage.setItem(ADMIN_SESSION_KEY, JSON.stringify(nextSession))
     setSession(nextSession)
   }
 
-  if (!session?.tokens?.accessToken) {
+  if (!session?.tokens?.accessToken || !session.tokens.refreshToken) {
     return <AdminLoginPage onLogin={handleLogin} />
   }
 
@@ -130,6 +240,22 @@ function AdminShell({ session, onLogout }: { session: AdminSession; onLogout: ()
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [search, setSearch] = useState('')
   const location = useLocation()
+
+  useEffect(() => {
+    let idleTimer = 0
+    const resetIdleTimer = () => {
+      window.clearTimeout(idleTimer)
+      idleTimer = window.setTimeout(onLogout, IDLE_TIMEOUT_MS)
+    }
+    const events: Array<keyof WindowEventMap> = ['pointerdown', 'keydown', 'touchstart']
+    events.forEach((eventName) => window.addEventListener(eventName, resetIdleTimer, { passive: true }))
+    resetIdleTimer()
+    return () => {
+      window.clearTimeout(idleTimer)
+      events.forEach((eventName) => window.removeEventListener(eventName, resetIdleTimer))
+    }
+  }, [onLogout])
+
   const allNavigation = navigation.concat(workspaceNavigation)
   const currentPage = allNavigation.find((item) => item.path === location.pathname)
   const searchResults = search.trim()
@@ -329,6 +455,9 @@ function AdminLoginPage({ onLogin }: { onLogin: (session: AdminSession) => void 
       }
 
       const nextSession = result.data as AdminSession
+      if (!nextSession?.tokens?.accessToken || !nextSession.tokens.refreshToken) {
+        throw new Error('The authentication service returned an incomplete session.')
+      }
       const roles = nextSession.user?.roles || [nextSession.user?.role]
       if (!roles.includes('admin')) {
         throw new Error('This account does not have administrator access. Contact your system administrator.')
@@ -379,11 +508,11 @@ function formatListingDate(value: string) {
   return Number.isNaN(date.getTime()) ? '—' : new Intl.DateTimeFormat('en-NG', { dateStyle: 'medium' }).format(date)
 }
 
-function ListingTable({ items, loading }: { items: AdminListing[]; loading: boolean }) {
-  return <div className="table-scroll"><table className="activity-table listings-table"><thead><tr><th>LISTING</th><th>TYPE</th><th>OWNER</th><th>VERIFICATION</th><th>SUBMITTED</th></tr></thead><tbody>
-    {items.map((item) => <tr key={item.id}><td><div className="listing-title-cell"><strong>{item.title}</strong><small>{[item.area, item.city].filter(Boolean).join(', ') || 'Location not provided'}</small></div></td><td><span className="type-pill">{formatListingType(item.type)}</span></td><td><div className="table-user compact-user"><div className="person-avatar green">{getInitials(item.ownerName)}</div><strong>{item.ownerName}</strong></div></td><td><StatusBadge status={item.status} /></td><td className="table-time">{formatListingDate(item.createdAt)}</td></tr>)}
-    {!loading && items.length === 0 && <tr><td colSpan={5} className="no-results">No listings found.</td></tr>}
-    {loading && items.length === 0 && <tr><td colSpan={5} className="no-results"><LoaderCircle size={16} className="spin-icon inline-spinner" /> Loading listings…</td></tr>}
+function ListingTable({ items, loading, onModerate, onAudit }: { items: AdminListing[]; loading: boolean; onModerate?: (item: AdminListing) => void; onAudit?: (item: AdminListing) => void }) {
+  return <div className="table-scroll"><table className="activity-table listings-table"><thead><tr><th>LISTING</th><th>TYPE</th><th>OWNER</th><th>VERIFICATION</th><th>SUBMITTED</th>{onModerate && <th>ACTIONS</th>}</tr></thead><tbody>
+    {items.map((item) => <tr key={item.id}><td><div className="listing-title-cell"><strong>{item.title}</strong><small>{[item.area, item.city].filter(Boolean).join(', ') || 'Location not provided'}</small></div></td><td><span className="type-pill">{formatListingType(item.type)}</span></td><td><div className="table-user compact-user"><div className="person-avatar green">{getInitials(item.ownerName)}</div><strong>{item.ownerName}</strong></div></td><td><StatusBadge status={item.status} /></td><td className="table-time">{formatListingDate(item.createdAt)}</td>{onModerate && <td><div className="listing-actions"><button type="button" onClick={() => onModerate(item)}>Review</button>{onAudit && <button type="button" className="audit-action" onClick={() => onAudit(item)}>Audit</button>}</div></td>}</tr>)}
+    {!loading && items.length === 0 && <tr><td colSpan={onModerate ? 6 : 5} className="no-results">No listings found.</td></tr>}
+    {loading && items.length === 0 && <tr><td colSpan={onModerate ? 6 : 5} className="no-results"><LoaderCircle size={16} className="spin-icon inline-spinner" /> Loading listings…</td></tr>}
   </tbody></table></div>
 }
 
@@ -393,6 +522,13 @@ function ModulePage({ title, path, session, onLogout }: { title: string; path: s
   const [listingPage, setListingPage] = useState<AdminListingPage | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [selected, setSelected] = useState<AdminListing | null>(null)
+  const [action, setAction] = useState<ModerationAction>('approve')
+  const [reason, setReason] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [auditItems, setAuditItems] = useState<ListingModerationAudit[]>([])
+  const [auditListing, setAuditListing] = useState<AdminListing | null>(null)
+  const [refreshKey, setRefreshKey] = useState(0)
   const isListings = path === '/listings'
 
   useEffect(() => {
@@ -413,17 +549,113 @@ function ModulePage({ title, path, session, onLogout }: { title: string; path: s
         .finally(() => { if (active) setLoading(false) })
     }, 250)
     return () => { active = false; window.clearTimeout(timer) }
-  }, [isListings, page, query, session.tokens.accessToken, onLogout])
+  }, [isListings, page, query, session.tokens.accessToken, onLogout, refreshKey])
+
+  const openReview = (item: AdminListing) => {
+    setSelected(item)
+    setAction('approve')
+    setReason('')
+  }
+
+  const submitModeration = async () => {
+    if (!selected || reason.trim().length < 3) {
+      setError('Provide a reason containing at least 3 characters.')
+      return
+    }
+    setSubmitting(true)
+    setError('')
+    try {
+      await adminFetch<unknown>(`/admin/listings/${selected.id}/moderate`, session.tokens.accessToken, {
+        method: 'POST',
+        body: { action, reason: reason.trim() },
+      })
+      setSelected(null)
+      setRefreshKey((key) => key + 1)
+    } catch (requestError: unknown) {
+      const error = requestError as Error & { status?: number }
+      if (error.status === 401) onLogout()
+      else setError(error.message)
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const openAudit = async (item: AdminListing) => {
+    setAuditListing(item)
+    setAuditItems([])
+    try {
+      const items = await adminFetch<ListingModerationAudit[]>(`/admin/listings/${item.id}/audit`, session.tokens.accessToken)
+      setAuditItems(items)
+    } catch (requestError: unknown) {
+      const error = requestError as Error & { status?: number }
+      if (error.status === 401) onLogout()
+      else setError(error.message)
+    }
+  }
 
   return <>
-    <section className="page-heading module-heading"><div><p className="eyebrow">OPERATIONS</p><h1>{title}</h1><p className="heading-subtitle">{isListings ? 'Read-only summaries for shared, roommate, and takeover listings.' : `A dedicated workspace for ${title.toLowerCase()} operations.`}</p></div></section>
+    <section className="page-heading module-heading"><div><p className="eyebrow">OPERATIONS</p><h1>{title}</h1><p className="heading-subtitle">{isListings ? 'Review and moderate shared, roommate, and takeover listings.' : `A dedicated workspace for ${title.toLowerCase()} operations.`}</p></div></section>
     {!isListings ? <><div className="module-preview"><div className="preview-icon"><BadgeCheck size={21} /></div><div><strong>{title} workspace</strong><p>This module will be enabled once its protected API and audit workflow are implemented.</p></div><span className="preview-chip">NOT CONNECTED</span></div><section className="module-empty panel"><div className="empty-illustration"><Settings2 size={25} /></div><h2>Backend integration comes next</h2><p>Live records and management actions remain unavailable until the backend exposes the required protected endpoints.</p><Link to="/" className="text-action">Back to overview <ArrowRight size={14} /></Link></section></> : <section className="panel module-table-panel">
-      <div className="table-toolbar"><label className="table-search"><Search size={16} /><input value={query} onChange={(event) => { setQuery(event.target.value); setPage(1) }} placeholder="Search listings, owners, or locations" /></label><span className="read-only-label"><LockKeyhole size={13} /> Read only</span></div>
+      <div className="table-toolbar"><label className="table-search"><Search size={16} /><input value={query} onChange={(event) => { setQuery(event.target.value); setPage(1) }} placeholder="Search listings, owners, or locations" /></label><span className="read-only-label"><ShieldAlert size={13} /> Protected moderation</span></div>
       {error && <div className="table-error" role="alert">{error}</div>}
-      <ListingTable items={listingPage?.items ?? []} loading={loading} />
+      <ListingTable items={listingPage?.items ?? []} loading={loading} onModerate={openReview} onAudit={openAudit} />
       <div className="table-pagination"><span>Showing <strong>{listingPage?.items.length ?? 0}</strong> of <strong>{listingPage?.total ?? 0}</strong> listings</span><div><button aria-label="Previous page" disabled={page <= 1 || loading} onClick={() => setPage((value) => value - 1)}><ChevronLeft size={16} /></button><span className="page-number">{page}</span><button aria-label="Next page" disabled={!listingPage || page * listingPage.limit >= listingPage.total || loading} onClick={() => setPage((value) => value + 1)}><ChevronRight size={16} /></button></div></div>
     </section>}
-    <div className="security-note"><ShieldAlert size={16} /><span>Administrative mutations remain disabled. All data access is enforced by the backend admin role guard.</span></div>
+    <div className="security-note"><ShieldAlert size={16} /><span>Listing decisions require an administrator role and a recorded moderation reason.</span></div>
+
+    {selected && <div className="moderation-panel">
+      <div className="panel-header"><h2>Moderate listing</h2><button className="icon-button panel-close" aria-label="Close" onClick={() => setSelected(null)}><X size={18} /></button></div>
+      <div className="panel-content">
+        <div className="moderation-listing">
+          <h3>{selected.title}</h3>
+          <p className="listing-meta"><span>{formatListingType(selected.type)}</span><span className="dot-separator" /><span>{[selected.area, selected.city].filter(Boolean).join(', ') || 'Location not provided'}</span></p>
+          <div className="listing-owner"><div className="owner-avatar">{getInitials(selected.ownerName)}</div><div className="owner-info"><strong>{selected.ownerName}</strong><span className="status-badge status-pending"><i />Pending</span></div></div>
+        </div>
+
+        <div className="moderation-actions">
+          <div className="action-group">
+            <button type="button" className="primary-button" onClick={() => { setAction('approve'); setReason('') }}>Approve listing</button>
+            <button type="button" className="secondary-button" onClick={() => { setAction('reject'); setReason('') }}>Reject listing</button>
+            <button type="button" className="secondary-button" onClick={() => { setAction('flag'); setReason('') }}>Flag for review</button>
+          </div>
+          <div className="action-reason">
+            <label htmlFor="moderation-reason">Reason for {action === 'approve' ? 'approving' : action === 'reject' ? 'rejecting' : 'flagging'}</label>
+            <textarea id="moderation-reason" value={reason} onChange={(event) => setReason(event.target.value)} placeholder={`Enter reason for ${action === 'approve' ? 'approving' : action === 'reject' ? 'rejecting' : 'flagging'} the listing`} rows={3} />
+          </div>
+          <div className="action-notes">
+            <p><strong>Note:</strong> {action === 'approve' ? 'The listing will be published and visible to users.' : action === 'reject' ? 'The listing will be hidden and the owner will be notified.' : 'The listing will remain private while an administrator completes review.'}</p>
+            <p>All moderation actions are logged for auditing purposes.</p>
+          </div>
+          <div className="action-group">
+            <button type="button" className="primary-button" onClick={submitModeration} disabled={submitting}>{submitting ? <LoaderCircle size={16} className="spin-icon" /> : 'Confirm action'}</button>
+            <button type="button" className="secondary-button" onClick={() => setSelected(null)}>Cancel</button>
+          </div>
+        </div>
+      </div>
+    </div>}
+
+    {auditListing && <div className="audit-panel">
+      <div className="panel-header"><h2>Audit log for {auditListing.title}</h2><button className="icon-button panel-close" aria-label="Close" onClick={() => setAuditListing(null)}><X size={18} /></button></div>
+      <div className="panel-content">
+        {auditItems.length === 0 ? <p className="no-audit-items">No audit records found for this listing.</p> : <div className="audit-list">
+          {auditItems.map((item) => {
+            const date = new Date(item.created_at)
+            return <div className="audit-item" key={item.id}>
+              <div className="audit-time"><time dateTime={item.created_at}>{date.toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' })}</time></div>
+              <div className="audit-content">
+                <div className="audit-header">
+                  <span className="audit-action">{item.action.charAt(0).toUpperCase() + item.action.slice(1)}</span>
+                  <span className="dot-separator" />
+                  <span className="audit-admin">{item.admin_id}</span>
+                </div>
+                <div className="audit-reason">{item.reason}</div>
+                <div className="audit-status"><StatusBadge status={item.new_status} /></div>
+              </div>
+            </div>
+          })}
+        </div>}
+      </div>
+    </div>}
   </>
 }
 
