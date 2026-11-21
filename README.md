@@ -25,6 +25,8 @@ The Vite dev server proxies `/api` to the configured backend origin. Set `VITE_B
 
 The frontend is not an authorization boundary. The current backend provides read-only admin overview and listing summary endpoints guarded by the `admin` role. Every new admin endpoint and mutation must enforce server-side roles, validate input, minimize sensitive data, and write an audit event. Admin account provisioning is documented in the backend `ADMIN_ACCESS.md`; do not grant admin access through public signup or client-side state.
 
+For local development credentials, run `npm run admin:create` from the backend directory and enter the email and password directly into its interactive terminal prompts. The command is blocked outside `NODE_ENV=development`; never commit credentials or put passwords in shell commands or frontend environment variables.
+
 ---
 
 The original Vite template notes are retained below for reference.
