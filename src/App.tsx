@@ -95,6 +95,36 @@ type ListingModerationAudit = {
   created_at: string
 }
 
+type VerificationStatus = 'pending' | 'approved' | 'rejected'
+
+type AdminVerification = {
+  id: string
+  userId: string
+  listingId: string | null
+  listingType: string
+  purpose: string
+  fileName: string
+  mimeType: string
+  status: VerificationStatus
+  reviewedBy: string | null
+  reviewedAt: string | null
+  rejectionReason: string | null
+  createdAt: string
+}
+
+type AdminVerificationPage = { items: AdminVerification[]; page: number; limit: number; total: number }
+
+type VerificationAudit = {
+  id: string
+  document_id: string
+  reviewer_id: string
+  decision: VerificationStatus
+  reason: string | null
+  previous_status: string
+  new_status: string
+  created_at: string
+}
+
 const ADMIN_SESSION_KEY = 'dh_admin_session'
 const IDLE_TIMEOUT_MS = 15 * 60 * 1000
 const ACCESS_REFRESH_WINDOW_MS = 60 * 1000
@@ -529,9 +559,35 @@ function ModulePage({ title, path, session, onLogout }: { title: string; path: s
   const [auditItems, setAuditItems] = useState<ListingModerationAudit[]>([])
   const [auditListing, setAuditListing] = useState<AdminListing | null>(null)
   const [refreshKey, setRefreshKey] = useState(0)
+  const [verificationPage, setVerificationPage] = useState<AdminVerificationPage | null>(null)
+  const [verificationStatus, setVerificationStatus] = useState('')
+  const [selectedVerification, setSelectedVerification] = useState<AdminVerification | null>(null)
+  const [verificationDecision, setVerificationDecision] = useState<'approved' | 'rejected'>('approved')
+  const [verificationReason, setVerificationReason] = useState('')
+  const [verificationAudit, setVerificationAudit] = useState<VerificationAudit[]>([])
+  const [documentLoading, setDocumentLoading] = useState(false)
   const isListings = path === '/listings'
+  const isVerification = path === '/verification'
 
   useEffect(() => {
+    if (isVerification) {
+      let active = true
+      const params = new URLSearchParams({ page: String(page), limit: '20' })
+      if (verificationStatus) params.set('status', verificationStatus)
+      if (query.trim()) params.set('search', query.trim())
+      setLoading(true)
+      setError('')
+      adminFetch<AdminVerificationPage>(`/admin/verifications?${params.toString()}`, session.tokens.accessToken)
+        .then((data) => { if (active) setVerificationPage(data) })
+        .catch((requestError: unknown) => {
+          if (!active) return
+          const error = requestError as Error & { status?: number }
+          if (error.status === 401) onLogout()
+          else setError(error.status === 403 ? 'This account does not have administrator access.' : error.message)
+        })
+        .finally(() => { if (active) setLoading(false) })
+      return () => { active = false }
+    }
     if (!isListings) return
     let active = true
     const timer = window.setTimeout(() => {
@@ -549,7 +605,7 @@ function ModulePage({ title, path, session, onLogout }: { title: string; path: s
         .finally(() => { if (active) setLoading(false) })
     }, 250)
     return () => { active = false; window.clearTimeout(timer) }
-  }, [isListings, page, query, session.tokens.accessToken, onLogout, refreshKey])
+  }, [isVerification, isListings, page, query, verificationStatus, session.tokens.accessToken, onLogout, refreshKey])
 
   const openReview = (item: AdminListing) => {
     setSelected(item)
@@ -593,9 +649,86 @@ function ModulePage({ title, path, session, onLogout }: { title: string; path: s
     }
   }
 
+  const openVerification = (item: AdminVerification) => {
+    setSelectedVerification(item)
+    setVerificationDecision('approved')
+    setVerificationReason('')
+    setVerificationAudit([])
+    void adminFetch<VerificationAudit[]>(`/admin/verifications/${item.id}/audit`, session.tokens.accessToken)
+      .then(setVerificationAudit)
+      .catch((requestError: unknown) => {
+        const error = requestError as Error & { status?: number }
+        if (error.status === 401) onLogout()
+      })
+  }
+
+  const submitVerification = async () => {
+    if (!selectedVerification || verificationReason.trim().length < 3) {
+      setError('A review reason containing at least 3 characters is required.')
+      return
+    }
+    setSubmitting(true)
+    setError('')
+    try {
+      await adminFetch<unknown>(`/admin/verifications/${selectedVerification.id}/decision`, session.tokens.accessToken, {
+        method: 'POST',
+        body: { decision: verificationDecision, reason: verificationReason.trim() },
+      })
+      setSelectedVerification(null)
+      setRefreshKey((key) => key + 1)
+    } catch (requestError: unknown) {
+      const error = requestError as Error & { status?: number }
+      if (error.status === 401) onLogout()
+      else setError(error.message)
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const openVerificationDocument = async (item: AdminVerification) => {
+    setDocumentLoading(true)
+    try {
+      let current = readAdminSession()
+      if (!current?.tokens?.refreshToken) throw makeAdminAuthError('Admin session is missing.', 401)
+      if (isAccessTokenExpiring(current.tokens.accessToken)) {
+        current = await refreshAdminSession()
+        if (!current) throw makeAdminAuthError('Admin session expired. Sign in again.', 401)
+      }
+      const response = await fetch(`/api/admin/verifications/${item.id}/document`, {
+        headers: { Authorization: `Bearer ${current.tokens.accessToken}` },
+        cache: 'no-store',
+      })
+      if (!response.ok) throw new Error(response.status === 403 ? 'This account cannot access verification documents.' : 'Unable to open verification document.')
+      const blob = await response.blob()
+      const url = URL.createObjectURL(blob)
+      window.open(url, '_blank', 'noopener,noreferrer')
+      window.setTimeout(() => URL.revokeObjectURL(url), 60_000)
+    } catch (requestError: unknown) {
+      const error = requestError as Error & { status?: number }
+      if (error.status === 401) onLogout()
+      else setError(error.message)
+    } finally {
+      setDocumentLoading(false)
+    }
+  }
+
   return <>
-    <section className="page-heading module-heading"><div><p className="eyebrow">OPERATIONS</p><h1>{title}</h1><p className="heading-subtitle">{isListings ? 'Review and moderate shared, roommate, and takeover listings.' : `A dedicated workspace for ${title.toLowerCase()} operations.`}</p></div></section>
-    {!isListings ? <><div className="module-preview"><div className="preview-icon"><BadgeCheck size={21} /></div><div><strong>{title} workspace</strong><p>This module will be enabled once its protected API and audit workflow are implemented.</p></div><span className="preview-chip">NOT CONNECTED</span></div><section className="module-empty panel"><div className="empty-illustration"><Settings2 size={25} /></div><h2>Backend integration comes next</h2><p>Live records and management actions remain unavailable until the backend exposes the required protected endpoints.</p><Link to="/" className="text-action">Back to overview <ArrowRight size={14} /></Link></section></> : <section className="panel module-table-panel">
+    <section className="page-heading module-heading"><div><p className="eyebrow">OPERATIONS</p><h1>{title}</h1><p className="heading-subtitle">{isListings ? 'Review and moderate shared, roommate, and takeover listings.' : isVerification ? 'Review protected identity documents submitted by listing hosts.' : `A dedicated workspace for ${title.toLowerCase()} operations.`}</p></div></section>
+    {isVerification ? <section className="panel module-table-panel">
+      <div className="table-toolbar">
+        <label className="table-search"><Search size={16} /><input value={query} onChange={(event) => { setQuery(event.target.value); setPage(1) }} placeholder="Search documents, types, or listing IDs" /></label>
+        <select className="verification-filter" value={verificationStatus} onChange={(event) => { setVerificationStatus(event.target.value); setPage(1) }}>
+          <option value="">All statuses</option><option value="pending">Pending</option><option value="approved">Approved</option><option value="rejected">Rejected</option>
+        </select>
+      </div>
+      {error && <div className="table-error" role="alert">{error}</div>}
+      <div className="table-scroll"><table className="activity-table listings-table"><thead><tr><th>DOCUMENT</th><th>LISTING</th><th>TYPE</th><th>STATUS</th><th>SUBMITTED</th><th>ACTIONS</th></tr></thead><tbody>
+        {(verificationPage?.items ?? []).map((item) => <tr key={item.id}><td><div className="listing-title-cell"><strong>{item.fileName}</strong><small>{item.purpose}</small></div></td><td>{item.listingId || 'Not linked'}</td><td><span className="type-pill">{formatListingType(item.listingType)}</span></td><td><StatusBadge status={item.status} /></td><td className="table-time">{formatListingDate(item.createdAt)}</td><td><div className="listing-actions"><button type="button" disabled={documentLoading} onClick={() => void openVerificationDocument(item)}>{documentLoading ? 'Opening…' : 'View document'}</button><button type="button" className="audit-action" onClick={() => openVerification(item)}>Review</button></div></td></tr>)}
+        {!loading && (verificationPage?.items.length ?? 0) === 0 && <tr><td colSpan={6} className="no-results">No verification documents found.</td></tr>}
+        {loading && (verificationPage?.items.length ?? 0) === 0 && <tr><td colSpan={6} className="no-results"><LoaderCircle size={16} className="spin-icon inline-spinner" /> Loading verification queue…</td></tr>}
+      </tbody></table></div>
+      <div className="table-pagination"><span>Showing <strong>{verificationPage?.items.length ?? 0}</strong> of <strong>{verificationPage?.total ?? 0}</strong> documents</span><div><button aria-label="Previous page" disabled={page <= 1 || loading} onClick={() => setPage((value) => value - 1)}><ChevronLeft size={16} /></button><span className="page-number">{page}</span><button aria-label="Next page" disabled={!verificationPage || page * verificationPage.limit >= verificationPage.total || loading} onClick={() => setPage((value) => value + 1)}><ChevronRight size={16} /></button></div></div>
+    </section> : !isListings ? <><div className="module-preview"><div className="preview-icon"><BadgeCheck size={21} /></div><div><strong>{title} workspace</strong><p>This module will be enabled once its protected API and audit workflow are implemented.</p></div><span className="preview-chip">NOT CONNECTED</span></div><section className="module-empty panel"><div className="empty-illustration"><Settings2 size={25} /></div><h2>Backend integration comes next</h2><p>Live records and management actions remain unavailable until the backend exposes the required protected endpoints.</p><Link to="/" className="text-action">Back to overview <ArrowRight size={14} /></Link></section></> : <section className="panel module-table-panel">
       <div className="table-toolbar"><label className="table-search"><Search size={16} /><input value={query} onChange={(event) => { setQuery(event.target.value); setPage(1) }} placeholder="Search listings, owners, or locations" /></label><span className="read-only-label"><ShieldAlert size={13} /> Protected moderation</span></div>
       {error && <div className="table-error" role="alert">{error}</div>}
       <ListingTable items={listingPage?.items ?? []} loading={loading} onModerate={openReview} onAudit={openAudit} />
@@ -654,6 +787,23 @@ function ModulePage({ title, path, session, onLogout }: { title: string; path: s
             </div>
           })}
         </div>}
+      </div>
+    </div>}
+
+    {selectedVerification && <div className="moderation-panel">
+      <div className="panel-header"><h2>Review verification</h2><button className="icon-button panel-close" aria-label="Close" onClick={() => setSelectedVerification(null)}><X size={18} /></button></div>
+      <div className="panel-content">
+        <div className="moderation-listing">
+          <h3>{selectedVerification.fileName}</h3>
+          <p className="listing-meta"><span>{formatListingType(selectedVerification.listingType)}</span><span className="dot-separator" /><span>{selectedVerification.listingId || 'Not linked'}</span></p>
+        </div>
+        <div className="moderation-actions">
+          <button type="button" className="primary-button" disabled={documentLoading} onClick={() => void openVerificationDocument(selectedVerification)}>{documentLoading ? 'Opening document…' : 'Open protected document'}</button>
+          <div className="action-group"><button type="button" className="primary-button" onClick={() => setVerificationDecision('approved')}>Approve</button><button type="button" className="secondary-button" onClick={() => setVerificationDecision('rejected')}>Reject</button></div>
+          <div className="action-reason"><label htmlFor="verification-reason">Review reason</label><textarea id="verification-reason" value={verificationReason} onChange={(event) => setVerificationReason(event.target.value)} placeholder={`Enter the reason for ${verificationDecision === 'approved' ? 'approval' : 'rejection'}`} rows={4} /></div>
+          <div className="action-group"><button type="button" className="primary-button" onClick={() => void submitVerification()} disabled={submitting}>{submitting ? <LoaderCircle size={16} className="spin-icon" /> : 'Confirm decision'}</button><button type="button" className="secondary-button" onClick={() => setSelectedVerification(null)}>Cancel</button></div>
+        </div>
+        <div className="verification-history"><h3>Review history</h3>{verificationAudit.length === 0 ? <p>No decisions recorded yet.</p> : verificationAudit.map((item) => <div className="audit-item" key={item.id}><div className="audit-time">{formatListingDate(item.created_at)}</div><div><strong>{item.decision}</strong><p>{item.reason || 'No reason provided'}</p><small>Reviewer: {item.reviewer_id}</small></div></div>)}</div>
       </div>
     </div>}
   </>

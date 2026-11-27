@@ -273,3 +273,11 @@ h1, h2, p { margin-top: 0; }
 .audit-header { display: flex; align-items: center; gap: 7px; color: #69736d; font-size: 9px; }
 .audit-action { color: #397754; font-weight: 700; }
 .audit-reason { margin: 7px 0; color: #4b564f; font-size: 10px; }
+.verification-filter { height: 33px; margin-left: auto; border: 1px solid #e8ece8; border-radius: 7px; background: #fff; color: #657069; padding: 0 9px; font-size: 9px; }
+.verification-history { margin-top: 22px; padding-top: 16px; border-top: 1px solid #edf0ed; }
+.verification-history h3 { margin: 0 0 10px; color: #344038; font-size: 11px; }
+.verification-history p { color: #87918a; font-size: 9px; }
+.verification-history .audit-item { grid-template-columns: 75px 1fr; }
+.verification-history .audit-item strong { color: #397754; font-size: 9px; text-transform: capitalize; }
+.verification-history .audit-item p { margin: 4px 0; }
+.verification-history .audit-item small { color: #929a95; font-size: 8px; }
